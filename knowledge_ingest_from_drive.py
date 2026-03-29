@@ -1,92 +1,213 @@
+import os
 import json
 import tempfile
-import os
 import psycopg
 from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
 from google.oauth2 import service_account
 from pypdf import PdfReader
 
+
 DB_URL = os.getenv("SUPABASE_DB_URL")
 FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
-CREDS_PATH = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
 SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 
-with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-    f.write(SERVICE_ACCOUNT_JSON)
-    creds_path = f.name
 
-creds = service_account.Credentials.from_service_account_file(
-    creds_path,
-    scopes=["https://www.googleapis.com/auth/drive.readonly"]
-)
+def require_env(name: str, value: str | None) -> str:
+    if not value:
+        raise RuntimeError(f"Missing required env var: {name}")
+    return value
 
-drive = build("drive", "v3", credentials=creds)
 
-def extract_pdf_text(file_path):
+def build_drive_client():
+    service_account_json = require_env("GOOGLE_SERVICE_ACCOUNT_JSON", SERVICE_ACCOUNT_JSON)
+
+    try:
+        json.loads(service_account_json)
+    except Exception as e:
+        raise RuntimeError(f"GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON: {e}")
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        f.write(service_account_json)
+        creds_path = f.name
+
+    creds = service_account.Credentials.from_service_account_file(
+        creds_path,
+        scopes=["https://www.googleapis.com/auth/drive.readonly"]
+    )
+    return build("drive", "v3", credentials=creds)
+
+
+def extract_pdf_text(file_path: str) -> str:
     reader = PdfReader(file_path)
     text = ""
     for page in reader.pages:
         text += page.extract_text() or ""
-    return text
+        text += "\n"
+    return text.strip()
 
-def chunk_text(text, size=500):
+
+def chunk_text(text: str, size: int = 500) -> list[str]:
     words = text.split()
     chunks = []
     for i in range(0, len(words), size):
-        chunks.append(" ".join(words[i:i+size]))
+        chunk = " ".join(words[i:i + size]).strip()
+        if chunk:
+            chunks.append(chunk)
     return chunks
 
+
+def download_drive_file(drive, file_id: str, target_path: str):
+    request = drive.files().get_media(fileId=file_id)
+    with open(target_path, "wb") as fh:
+        downloader = MediaIoBaseDownload(fh, request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+
+
+def upsert_knowledge_file(cur, file_id: str, file_name: str, extracted_text: str):
+    cur.execute("""
+        insert into knowledge_files (
+            file_id,
+            file_name,
+            source,
+            doc_kind,
+            trail,
+            extracted_text,
+            metadata,
+            created_at
+        )
+        values (%s, %s, %s, %s, %s, %s, %s::jsonb, now())
+        on conflict (file_id) do update set
+            file_name = excluded.file_name,
+            source = excluded.source,
+            extracted_text = excluded.extracted_text,
+            metadata = excluded.metadata
+        returning id
+    """, (
+        file_id,
+        file_name,
+        "google_drive",
+        "pdf",
+        "vectorized",
+        extracted_text,
+        json.dumps({"file_name": file_name})
+    ))
+    return cur.fetchone()[0]
+
+
+def replace_document_and_chunks(cur, file_id: str, file_name: str, extracted_text: str):
+    # remove docs/chunks antigos do mesmo arquivo
+    cur.execute("""
+        delete from knowledge_chunks
+        where document_id in (
+            select id from knowledge_documents where file_id = %s
+        )
+    """, (file_id,))
+
+    cur.execute("delete from knowledge_documents where file_id = %s", (file_id,))
+
+    cur.execute("""
+        insert into knowledge_documents (
+            file_id,
+            title,
+            content,
+            metadata,
+            created_at
+        )
+        values (%s, %s, %s, %s::jsonb, now())
+        returning id
+    """, (
+        file_id,
+        file_name,
+        extracted_text,
+        json.dumps({
+            "source": "google_drive",
+            "file_name": file_name,
+            "trail": "vectorized"
+        })
+    ))
+    doc_id = cur.fetchone()[0]
+
+    chunks = chunk_text(extracted_text, size=500)
+
+    for idx, chunk in enumerate(chunks):
+        cur.execute("""
+            insert into knowledge_chunks (
+                document_id,
+                chunk_index,
+                content,
+                metadata,
+                created_at
+            )
+            values (%s, %s, %s, %s::jsonb, now())
+        """, (
+            doc_id,
+            idx,
+            chunk,
+            json.dumps({
+                "file_id": file_id,
+                "file_name": file_name,
+                "chunk_index": idx
+            })
+        ))
+
+    return doc_id, len(chunks)
+
+
 def main():
-    conn = psycopg.connect(DB_URL)
-    cur = conn.cursor()
+    db_url = require_env("SUPABASE_DB_URL", DB_URL)
+    folder_id = require_env("GOOGLE_DRIVE_FOLDER_ID", FOLDER_ID)
+
+    drive = build_drive_client()
 
     results = drive.files().list(
-        q=f"'{FOLDER_ID}' in parents and mimeType='application/pdf'",
-        fields="files(id, name)"
+        q=f"'{folder_id}' in parents and mimeType='application/pdf' and trashed=false",
+        fields="files(id, name, modifiedTime)"
     ).execute()
 
     files = results.get("files", [])
 
-    for f in files:
-        file_id = f["id"]
-        file_name = f["name"]
+    if not files:
+        print("No PDF files found in the folder.")
+        return
 
-        request = drive.files().get_media(fileId=file_id)
-        file_path = f"/tmp/{file_name}"
+    conn = psycopg.connect(db_url)
+    cur = conn.cursor()
 
-        with open(file_path, "wb") as fh:
-            fh.write(request.execute())
+    processed = 0
 
-        text = extract_pdf_text(file_path)
+    try:
+        for f in files:
+            file_id = f["id"]
+            file_name = f["name"]
 
-        cur.execute("""
-            insert into knowledge_files (file_id, file_name, source, extracted_text)
-            values (%s, %s, %s, %s)
-            returning id
-        """, (file_id, file_name, "drive", text))
+            safe_name = file_name.replace("/", "_")
+            file_path = f"/tmp/{safe_name}"
 
-        file_db_id = cur.fetchone()[0]
+            print(f"Processing: {file_name} ({file_id})")
 
-        cur.execute("""
-            insert into knowledge_documents (file_id, title, content)
-            values (%s, %s, %s)
-            returning id
-        """, (file_id, file_name, text))
+            download_drive_file(drive, file_id, file_path)
+            text = extract_pdf_text(file_path)
 
-        doc_id = cur.fetchone()[0]
+            if not text.strip():
+                print(f"Skipping empty PDF text: {file_name}")
+                continue
 
-        chunks = chunk_text(text)
+            upsert_knowledge_file(cur, file_id, file_name, text)
+            _, chunk_count = replace_document_and_chunks(cur, file_id, file_name, text)
 
-        for i, chunk in enumerate(chunks):
-            cur.execute("""
-                insert into knowledge_chunks (document_id, chunk_index, content)
-                values (%s, %s, %s)
-            """, (doc_id, i, chunk))
+            conn.commit()
+            processed += 1
+            print(f"Done: {file_name} | chunks={chunk_count}")
 
-        conn.commit()
+        print(f"Processed files: {processed}")
 
-    cur.close()
-    conn.close()
+    finally:
+        cur.close()
+        conn.close()
+
 
 if __name__ == "__main__":
     main()
