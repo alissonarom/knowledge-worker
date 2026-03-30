@@ -1,6 +1,6 @@
-import os
-import subprocess
 from fastapi import FastAPI
+import subprocess
+import os
 
 app = FastAPI(title="Knowledge Worker", version="1.0.0")
 
@@ -12,7 +12,14 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"ok": True}
+    return {
+        "ok": True,
+        "env_check": {
+            "SUPABASE_DB_URL": bool(os.getenv("SUPABASE_DB_URL")),
+            "GOOGLE_DRIVE_FOLDER_ID": bool(os.getenv("GOOGLE_DRIVE_FOLDER_ID")),
+            "GOOGLE_SERVICE_ACCOUNT_JSON": bool(os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")),
+        }
+    }
 
 
 @app.post("/ingest")
