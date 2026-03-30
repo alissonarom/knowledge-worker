@@ -17,7 +17,7 @@ def health():
         "env_check": {
             "SUPABASE_DB_URL": bool(os.getenv("SUPABASE_DB_URL")),
             "GOOGLE_DRIVE_FOLDER_ID": bool(os.getenv("GOOGLE_DRIVE_FOLDER_ID")),
-            "GOOGLE_SERVICE_ACCOUNT_JSON": bool(os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")),
+            "GOOGLE_SERVICE_ACCOUNT_JSON_BASE64": bool(os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_BASE64")),
         }
     }
 
