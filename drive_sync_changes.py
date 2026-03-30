@@ -1,5 +1,6 @@
 import os
 import json
+import base64
 import tempfile
 import psycopg
 from googleapiclient.discovery import build
@@ -7,7 +8,7 @@ from google.oauth2 import service_account
 
 
 DB_URL = os.getenv("SUPABASE_DB_URL")
-SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+SERVICE_ACCOUNT_JSON_BASE64 = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_BASE64")
 
 
 def require_env(name: str, value: str | None) -> str:
@@ -17,15 +18,16 @@ def require_env(name: str, value: str | None) -> str:
 
 
 def build_drive_client():
-    service_account_json = require_env("GOOGLE_SERVICE_ACCOUNT_JSON", SERVICE_ACCOUNT_JSON)
+    b64 = require_env("GOOGLE_SERVICE_ACCOUNT_JSON_BASE64", SERVICE_ACCOUNT_JSON_BASE64)
 
     try:
-        json.loads(service_account_json)
+        decoded = base64.b64decode(b64).decode("utf-8")
+        json.loads(decoded)
     except Exception as e:
-        raise RuntimeError(f"GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON: {e}")
+        raise RuntimeError(f"GOOGLE_SERVICE_ACCOUNT_JSON_BASE64 is invalid: {e}")
 
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-        f.write(service_account_json)
+        f.write(decoded)
         creds_path = f.name
 
     creds = service_account.Credentials.from_service_account_file(
